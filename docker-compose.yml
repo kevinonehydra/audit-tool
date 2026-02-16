@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: sc_audit_db
+    environment:
+      POSTGRES_USER: sc
+      POSTGRES_PASSWORD: sc_dev_password
+      POSTGRES_DB: sc_audit
+    ports:
+      - "5433:5432"
+    volumes:
+      - sc_audit_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sc -d sc_audit"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  sc_audit_pgdata:

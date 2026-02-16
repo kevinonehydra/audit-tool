@@ -1,0 +1,231 @@
+// apps/api/src/routes/findings.routes.js
+// Findings + Evidence API
+// - List findings for an audit
+// - Create findings for an audit
+// - Attach existing uploaded media as evidence
+// - Remove evidence
+// - Delete finding
+
+export function registerFindingsRoutes(app) {
+  // -----------------------------
+  // GET /audits/:auditId/findings
+  // -----------------------------
+  app.get("/audits/:auditId/findings", async (req, reply) => {
+    try {
+      const { auditId } = req.params;
+
+      const findings = await app.prisma.finding.findMany({
+        where: { auditId },
+        orderBy: { createdAt: "desc" },
+        include: {
+          evidence: {
+            orderBy: { createdAt: "desc" },
+            include: { media: true },
+          },
+        },
+      });
+
+      return reply.send({ ok: true, auditId, findings });
+    } catch (err) {
+      req.log?.error?.(err);
+      return reply.code(500).send({
+        statusCode: 500,
+        error: "Internal Server Error",
+        message: err?.message || "Failed to list findings",
+      });
+    }
+  });
+
+  // -----------------------------
+  // POST /audits/:auditId/findings
+  // body: { title, description?, severity?, area?, clauseRef? }
+  // -----------------------------
+  app.post("/audits/:auditId/findings", async (req, reply) => {
+    try {
+      const { auditId } = req.params;
+      const body = req.body || {};
+
+      const title = String(body.title || "").trim();
+      if (!title) {
+        return reply.code(400).send({
+          statusCode: 400,
+          error: "Bad Request",
+          message: "title is required",
+        });
+      }
+
+      const finding = await app.prisma.finding.create({
+        data: {
+          auditId,
+          title,
+          description: body.description ? String(body.description) : null,
+          severity: body.severity ? String(body.severity) : "medium",
+          area: body.area ? String(body.area) : null,
+          clauseRef: body.clauseRef ? String(body.clauseRef) : null,
+        },
+      });
+
+      return reply.code(201).send({ ok: true, auditId, finding });
+    } catch (err) {
+      req.log?.error?.(err);
+      return reply.code(500).send({
+        statusCode: 500,
+        error: "Internal Server Error",
+        message: err?.message || "Failed to create finding",
+      });
+    }
+  });
+
+  // -------------------------------------------
+  // POST /findings/:findingId/evidence
+  // body: { mediaId, note? }
+  // attaches an existing MediaFile to a Finding
+  // -------------------------------------------
+  app.post("/findings/:findingId/evidence", async (req, reply) => {
+    try {
+      const { findingId } = req.params;
+      const body = req.body || {};
+
+      const mediaId = String(body.mediaId || "").trim();
+      if (!mediaId) {
+        return reply.code(400).send({
+          statusCode: 400,
+          error: "Bad Request",
+          message: "mediaId is required",
+        });
+      }
+
+      // Ensure finding exists
+      const finding = await app.prisma.finding.findUnique({
+        where: { id: findingId },
+        select: { id: true, auditId: true },
+      });
+
+      if (!finding) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: "Not Found",
+          message: "finding not found",
+        });
+      }
+
+      // Ensure media exists
+      const media = await app.prisma.mediaFile.findUnique({
+        where: { id: mediaId },
+        select: { id: true, auditId: true },
+      });
+
+      if (!media) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: "Not Found",
+          message: "media not found",
+        });
+      }
+
+      // Optional safety: only allow linking media from same audit
+      if (media.auditId !== finding.auditId) {
+        return reply.code(400).send({
+          statusCode: 400,
+          error: "Bad Request",
+          message: "media.auditId must match finding.auditId",
+        });
+      }
+
+      const evidence = await app.prisma.findingEvidence.create({
+        data: {
+          findingId,
+          mediaId,
+          note: body.note ? String(body.note) : null,
+        },
+        include: { media: true },
+      });
+
+      return reply.code(201).send({ ok: true, evidence });
+    } catch (err) {
+      // Prisma unique constraint (findingId, mediaId) duplicates
+      if (String(err?.code || "") === "P2002") {
+        return reply.code(409).send({
+          statusCode: 409,
+          error: "Conflict",
+          message: "evidence link already exists for this finding + media",
+        });
+      }
+
+      req.log?.error?.(err);
+      return reply.code(500).send({
+        statusCode: 500,
+        error: "Internal Server Error",
+        message: err?.message || "Failed to attach evidence",
+      });
+    }
+  });
+
+  // -------------------------------------------
+  // DELETE /findings/:findingId/evidence/:mediaId
+  // removes link between finding and media
+  // -------------------------------------------
+  app.delete("/findings/:findingId/evidence/:mediaId", async (req, reply) => {
+    try {
+      const { findingId, mediaId } = req.params;
+
+      // composite unique: (findingId, mediaId)
+      await app.prisma.findingEvidence.delete({
+        where: {
+          findingId_mediaId: {
+            findingId,
+            mediaId,
+          },
+        },
+      });
+
+      return reply.send({ ok: true, findingId, mediaId, deleted: true });
+    } catch (err) {
+      if (String(err?.code || "") === "P2025") {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: "Not Found",
+          message: "evidence link not found",
+        });
+      }
+
+      req.log?.error?.(err);
+      return reply.code(500).send({
+        statusCode: 500,
+        error: "Internal Server Error",
+        message: err?.message || "Failed to delete evidence link",
+      });
+    }
+  });
+
+  // -----------------------------
+  // DELETE /findings/:findingId
+  // deletes a finding (cascade deletes evidence)
+  // -----------------------------
+  app.delete("/findings/:findingId", async (req, reply) => {
+    try {
+      const { findingId } = req.params;
+
+      await app.prisma.finding.delete({
+        where: { id: findingId },
+      });
+
+      return reply.send({ ok: true, findingId, deleted: true });
+    } catch (err) {
+      if (String(err?.code || "") === "P2025") {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: "Not Found",
+          message: "finding not found",
+        });
+      }
+
+      req.log?.error?.(err);
+      return reply.code(500).send({
+        statusCode: 500,
+        error: "Internal Server Error",
+        message: err?.message || "Failed to delete finding",
+      });
+    }
+  });
+}

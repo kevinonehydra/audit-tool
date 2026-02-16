@@ -1,0 +1,29 @@
+{
+  "name": "sc-audit-copilot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.28.2",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/multipart": "^9.4.0",
+    "@prisma/client": "^6.19.2",
+    "bcryptjs": "^3.0.3",
+    "docxtemplater": "^3.67.6",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.7.2",
+    "pdfkit": "^0.17.2",
+    "pizzip": "^3.2.0",
+    "prisma": "^6.19.2",
+    "xlsx": "^0.18.5"
+  }
+}

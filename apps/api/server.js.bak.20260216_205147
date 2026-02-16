@@ -1,0 +1,650 @@
+import Fastify from "fastify";
+import multipart from "@fastify/multipart";
+import { PrismaClient } from "@prisma/client";
+
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
+
+import PDFDocument from "pdfkit";
+import * as XLSX from "xlsx";
+
+import PizZip from "pizzip";
+import Docxtemplater from "docxtemplater";
+
+import { registerFindingsRoutes } from "./src/routes/findings.routes.js";
+
+// --------------------
+// Config
+// --------------------
+const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || "127.0.0.1";
+const DATABASE_URL = process.env.DATABASE_URL || "";
+
+// 5GB default if env missing
+const MAX_UPLOAD_BYTES = Number(
+  process.env.MAX_UPLOAD_BYTES || 5 * 1024 * 1024 * 1024
+);
+
+const STORAGE_ROOT = path.resolve(process.cwd(), "storage", "audits");
+const TEMPLATE_PATH = path.resolve(
+  process.cwd(),
+  "templates",
+  "audit-template.docx"
+);
+
+// --------------------
+// App + Prisma
+// --------------------
+const prisma = new PrismaClient();
+const app = Fastify({ logger: true });
+
+// Attach prisma to app so route modules can use app.prisma
+app.prisma = prisma;
+
+// Multipart file-size limits
+await app.register(multipart, {
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES, // hard cap per uploaded file
+  },
+});
+
+// --------------------
+// Helpers: storage
+// --------------------
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
+
+function kindToSubdir(kind) {
+  const k = (kind || "").toLowerCase();
+  if (k === "image") return "images";
+  if (k === "video") return "video";
+  if (k === "audio") return "audio";
+  return "uploads";
+}
+
+function safeFilename(name) {
+  const base = (name || "file").replace(/[^a-zA-Z0-9._-]/g, "_");
+  return base.slice(0, 180);
+}
+
+function makeStorageKey({ auditId, kind, originalName }) {
+  const ext = path.extname(originalName || "");
+  const rand = crypto.randomBytes(8).toString("hex");
+  const sub = kindToSubdir(kind);
+  // This is a RELATIVE key stored in DB, later used to build absolute path.
+  return path.join(auditId, "media", sub, `${Date.now()}_${rand}${ext}`);
+}
+
+function absPathForKey(storageKey) {
+  // Absolute path where we store files on disk
+  return path.join(STORAGE_ROOT, storageKey);
+}
+
+function safeResolveUnderRoot(rootDir, relativeKey) {
+  // Prevent path traversal: resolve and verify it stays under STORAGE_ROOT
+  const root = path.resolve(rootDir);
+  const resolved = path.resolve(rootDir, relativeKey);
+
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (!resolved.startsWith(rootWithSep) && resolved !== root) {
+    throw new Error("Invalid storage key (path traversal blocked)");
+  }
+  return resolved;
+}
+
+async function writeStreamToFileAndCountBytes(readable, outPath) {
+  await ensureDir(path.dirname(outPath));
+
+  let sizeBytes = 0;
+
+  const counter = new Transform({
+    transform(chunk, enc, cb) {
+      sizeBytes += chunk.length;
+      cb(null, chunk);
+    },
+  });
+
+  const ws = fs.createWriteStream(outPath, { flags: "wx" });
+  await pipeline(readable, counter, ws);
+
+  return sizeBytes;
+}
+
+// --------------------
+// Helpers: CSV parsing (small files only)
+// --------------------
+function parseCsvToRows(csvText) {
+  const lines = csvText.split(/\r?\n/).filter(Boolean);
+  if (lines.length === 0) return { header: [], rows: [] };
+
+  const parseLine = (line) => {
+    const out = [];
+    let cur = "";
+    let inQ = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+
+      if (ch === '"' && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inQ = !inQ;
+        continue;
+      }
+      if (ch === "," && !inQ) {
+        out.push(cur);
+        cur = "";
+        continue;
+      }
+      cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  };
+
+  const header = parseLine(lines[0]);
+  const rows = lines
+    .slice(1)
+    .map(parseLine)
+    .map((cols) => {
+      const obj = {};
+      for (let i = 0; i < header.length; i++) obj[header[i]] = cols[i] ?? "";
+      return obj;
+    });
+
+  return { header, rows };
+}
+
+function normalizeStatus(s) {
+  const v = String(s || "").trim().toUpperCase();
+  if (v === "PASS" || v === "OK") return "PASS";
+  if (v === "FAIL" || v === "NG") return "FAIL";
+  if (v === "NA" || v === "N/A") return "NA";
+  return v ? v : "UNKNOWN";
+}
+
+function computeSummary(items) {
+  const summary = { total: items.length, pass: 0, fail: 0, na: 0, unknown: 0 };
+  for (const it of items) {
+    if (it.status === "PASS") summary.pass++;
+    else if (it.status === "FAIL") summary.fail++;
+    else if (it.status === "NA") summary.na++;
+    else summary.unknown++;
+  }
+  return summary;
+}
+
+async function readSmallUploadToBuffer(file, maxBytes = 25 * 1024 * 1024) {
+  // For CSV uploads / report parsing only. Not for huge video files.
+  const parts = [];
+  let total = 0;
+
+  for await (const chunk of file.file) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      throw new Error(`Upload too large for report parsing (>${maxBytes} bytes)`);
+    }
+    parts.push(chunk);
+  }
+  return Buffer.concat(parts);
+}
+
+// --------------------
+// Helpers: reports
+// --------------------
+function buildPdfBuffer({ title, summary, items }) {
+  const doc = new PDFDocument({ size: "A4", margin: 50 });
+  const chunks = [];
+  doc.on("data", (d) => chunks.push(d));
+
+  return new Promise((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    doc.fontSize(18).text(title || "Audit Report", { align: "left" });
+    doc.moveDown();
+
+    doc.fontSize(12).text(`Total: ${summary.total}`);
+    doc.text(`PASS: ${summary.pass}`);
+    doc.text(`FAIL: ${summary.fail}`);
+    doc.text(`N/A: ${summary.na}`);
+    doc.text(`UNKNOWN: ${summary.unknown}`);
+    doc.moveDown();
+
+    doc.fontSize(12).text("Items:");
+    doc.moveDown(0.5);
+
+    for (const it of items) {
+      doc.text(`${it.idx}. ${it.id} — ${it.status} — ${it.comment || ""}`);
+    }
+
+    doc.end();
+  });
+}
+
+function buildXlsxBuffer({ sheetName, items }) {
+  const wsData = [
+    ["#", "Item", "Status", "Comment"],
+    ...items.map((it) => [it.idx, it.id, it.status, it.comment || ""]),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName || "Sheet1");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+// --------------------
+// Helpers: DOCX template rendering
+// --------------------
+function renderDocxFromTemplate({ templatePath, data }) {
+  const content = fs.readFileSync(templatePath, "binary");
+  const zip = new PizZip(content);
+  const doc = new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
+  doc.render(data);
+  return doc.getZip().generate({ type: "nodebuffer" });
+}
+
+function makeDocxData({ audit, summary, items }) {
+  return {
+    title: audit.title || "Audit Report",
+    site: audit.site || "",
+    standard: audit.standard || "",
+    auditor: audit.auditor || "",
+    generatedAt: new Date().toISOString(),
+    total: summary.total,
+    pass: summary.pass,
+    fail: summary.fail,
+    na: summary.na,
+    unknown: summary.unknown,
+    items: items.map((it) => ({
+      idx: it.idx,
+      id: it.id,
+      status: it.status,
+      comment: it.comment || "",
+    })),
+  };
+}
+
+// --------------------
+// Routes
+// --------------------
+app.get("/health", async () => ({
+  ok: true,
+  service: "sc-audit-copilot",
+  status: "running",
+  dbUrlLoaded: Boolean(DATABASE_URL),
+  maxUploadBytes: MAX_UPLOAD_BYTES,
+}));
+
+// List audits
+app.get("/audits", async (req, reply) => {
+  const take = Math.min(Number(req.query?.take || 20), 100);
+  const skip = Math.max(Number(req.query?.skip || 0), 0);
+
+  const audits = await prisma.audit.findMany({
+    take,
+    skip,
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      createdAt: true,
+      updatedAt: true,
+      title: true,
+      site: true,
+      standard: true,
+      auditor: true,
+      sourceFile: true,
+    },
+  });
+
+  return reply.send({ ok: true, take, skip, audits });
+});
+
+// Get single audit
+app.get("/audits/:auditId", async (req, reply) => {
+  const { auditId } = req.params;
+
+  const audit = await prisma.audit.findUnique({
+    where: { id: auditId },
+    include: {
+      media: { orderBy: { createdAt: "desc" } },
+    },
+  });
+
+  if (!audit) {
+    return reply.code(404).send({
+      statusCode: 404,
+      error: "Not Found",
+      message: "audit not found",
+    });
+  }
+
+  return reply.send({ ok: true, audit });
+});
+
+// Create audit
+app.post("/audits", async (req, reply) => {
+  try {
+    const body = req.body || {};
+
+    const audit = await prisma.audit.create({
+      data: {
+        title: body.title ? String(body.title) : null,
+        standard: body.standard ? String(body.standard) : null,
+        site: body.site ? String(body.site) : null,
+        auditor: body.auditor ? String(body.auditor) : null,
+      },
+    });
+
+    return reply.code(201).send({ ok: true, audit });
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({
+      statusCode: 500,
+      error: "Internal Server Error",
+      message: err?.message || "Failed to create audit",
+    });
+  }
+});
+
+// --------------------
+// Media upload
+// POST /audits/:auditId/media?kind=image|video|audio|file
+// form-data: file=@...
+// --------------------
+app.post("/audits/:auditId/media", async (req, reply) => {
+  try {
+    const { auditId } = req.params;
+    const kind = String(req.query?.kind || "file").toLowerCase();
+
+    // Ensure audit exists
+    const audit = await prisma.audit.findUnique({
+      where: { id: auditId },
+      select: { id: true },
+    });
+
+    if (!audit) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: "Not Found",
+        message: "audit not found",
+      });
+    }
+
+    const file = await req.file();
+    if (!file) {
+      return reply.code(400).send({
+        statusCode: 400,
+        error: "Bad Request",
+        message: "multipart file field 'file' is required",
+      });
+    }
+
+    const originalName = safeFilename(file.filename || "upload.bin");
+    const storageKey = makeStorageKey({
+      auditId,
+      kind,
+      originalName,
+    });
+
+    const outPath = absPathForKey(storageKey);
+    const sizeBytes = await writeStreamToFileAndCountBytes(file.file, outPath);
+
+    const created = await prisma.mediaFile.create({
+      data: {
+        auditId,
+        kind,
+        filename: originalName,
+        mime: file.mimetype || "application/octet-stream",
+        sizeBytes,
+        storageKey,
+      },
+    });
+
+    return reply.code(201).send({
+      ok: true,
+      auditId,
+      mediaId: created.id,
+      ...created,
+    });
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({
+      statusCode: 500,
+      error: "Internal Server Error",
+      message: err?.message || "Failed to upload media",
+    });
+  }
+});
+
+// List media for audit
+app.get("/audits/:auditId/media", async (req, reply) => {
+  try {
+    const { auditId } = req.params;
+
+    const audit = await prisma.audit.findUnique({
+      where: { id: auditId },
+      select: {
+        id: true,
+        createdAt: true,
+        title: true,
+        site: true,
+        standard: true,
+        auditor: true,
+      },
+    });
+
+    if (!audit) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: "Not Found",
+        message: "audit not found",
+      });
+    }
+
+    const media = await prisma.mediaFile.findMany({
+      where: { auditId },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        createdAt: true,
+        kind: true,
+        filename: true,
+        mime: true,
+        sizeBytes: true,
+        storageKey: true,
+      },
+    });
+
+    return reply.send({ ok: true, auditId, audit, media });
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({
+      statusCode: 500,
+      error: "Internal Server Error",
+      message: err?.message || "Failed to list audit media",
+    });
+  }
+});
+
+// Media download
+// GET /media/:mediaId/download
+app.get("/media/:mediaId/download", async (req, reply) => {
+  try {
+    const { mediaId } = req.params;
+
+    const media = await prisma.mediaFile.findUnique({
+      where: { id: mediaId },
+    });
+
+    if (!media) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: "Not Found",
+        message: "media not found",
+      });
+    }
+
+    const filePath = safeResolveUnderRoot(STORAGE_ROOT, media.storageKey);
+
+    if (!fs.existsSync(filePath)) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: "Not Found",
+        message: "file missing on disk",
+      });
+    }
+
+    const stat = fs.statSync(filePath);
+
+    reply.header("Content-Type", media.mime || "application/octet-stream");
+    reply.header("Content-Length", stat.size);
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="${media.filename || "download.bin"}"`
+    );
+
+    return reply.send(fs.createReadStream(filePath));
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({
+      statusCode: 500,
+      error: "Internal Server Error",
+      message: err?.message || "Failed to download media",
+    });
+  }
+});
+
+// --------------------
+// Optional: report generation from uploaded CSV (small)
+// POST /audits/:auditId/report/from-csv
+// form-data: file=@report.csv
+// returns: pdf/xlsx/docx buffers (json with base64 is avoided; we stream one at a time)
+// query: format=pdf|xlsx|docx  (default pdf)
+// --------------------
+app.post("/audits/:auditId/report/from-csv", async (req, reply) => {
+  try {
+    const { auditId } = req.params;
+    const format = String(req.query?.format || "pdf").toLowerCase();
+
+    const audit = await prisma.audit.findUnique({
+      where: { id: auditId },
+    });
+
+    if (!audit) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: "Not Found",
+        message: "audit not found",
+      });
+    }
+
+    const file = await req.file();
+    if (!file) {
+      return reply.code(400).send({
+        statusCode: 400,
+        error: "Bad Request",
+        message: "multipart file field 'file' is required",
+      });
+    }
+
+    const buf = await readSmallUploadToBuffer(file);
+    const text = buf.toString("utf8");
+    const { rows } = parseCsvToRows(text);
+
+    const items = rows.map((r, idx) => ({
+      idx: idx + 1,
+      id: String(r.Item || r.ID || r.id || r.Clauses || r.Clause || r["Clause ID"] || `Item${idx + 1}`),
+      status: normalizeStatus(r.Status || r.status),
+      comment: String(r.Comment || r.comment || ""),
+    }));
+
+    const summary = computeSummary(items);
+
+    if (format === "xlsx") {
+      const xlsx = buildXlsxBuffer({ sheetName: "Audit", items });
+      reply.header(
+        "Content-Disposition",
+        `attachment; filename="${safeFilename(audit.title || "audit")}.xlsx"`
+      );
+      reply.type(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      return reply.send(xlsx);
+    }
+
+    if (format === "docx") {
+      const data = makeDocxData({ audit, summary, items });
+      const docx = renderDocxFromTemplate({ templatePath: TEMPLATE_PATH, data });
+      reply.header(
+        "Content-Disposition",
+        `attachment; filename="${safeFilename(audit.title || "audit")}.docx"`
+      );
+      reply.type(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      );
+      return reply.send(docx);
+    }
+
+    // default pdf
+    const pdf = await buildPdfBuffer({
+      title: audit.title || "Audit Report",
+      summary,
+      items,
+    });
+
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="${safeFilename(audit.title || "audit")}.pdf"`
+    );
+    reply.type("application/pdf");
+    return reply.send(pdf);
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({
+      statusCode: 500,
+      error: "Internal Server Error",
+      message: err?.message || "Failed to generate report",
+    });
+  }
+});
+
+// --------------------
+// Register Findings routes (Stage 3 addition)
+// --------------------
+registerFindingsRoutes(app);
+
+// --------------------
+// Boot
+// --------------------
+app.listen({ port: PORT, host: HOST }, (err, address) => {
+  if (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+  console.log(`Server running at ${address}`);
+  console.log(`Storage root: ${STORAGE_ROOT}`);
+  console.log(`Max upload bytes: ${MAX_UPLOAD_BYTES}`);
+});
+
+// Graceful shutdown (nice-to-have)
+process.on("SIGINT", async () => {
+  try {
+    await prisma.$disconnect();
+  } catch {}
+  process.exit(0);
+});
+process.on("SIGTERM", async () => {
+  try {
+    await prisma.$disconnect();
+  } catch {}
+  process.exit(0);
+});

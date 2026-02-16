@@ -1,0 +1,473 @@
+import Fastify from "fastify";
+import multipart from "@fastify/multipart";
+import { PrismaClient } from "@prisma/client";
+
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+
+import PDFDocument from "pdfkit";
+import * as XLSX from "xlsx";
+
+import PizZip from "pizzip";
+import Docxtemplater from "docxtemplater";
+
+// --------------------
+// Config
+// --------------------
+const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || "127.0.0.1";
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const STORAGE_ROOT = path.resolve(process.cwd(), "storage", "audits");
+const TEMPLATE_PATH = path.resolve(process.cwd(), "templates", "audit-template.docx");
+
+const prisma = new PrismaClient();
+
+const app = Fastify({ logger: true });
+await app.register(multipart, {
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+});
+
+// --------------------
+// Helpers: storage
+// --------------------
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
+
+function auditsRoot() {
+  return STORAGE_ROOT;
+}
+
+function auditDir(auditId) {
+  return path.join(auditsRoot(), auditId);
+}
+
+function kindToSubdir(kind) {
+  const k = (kind || "").toLowerCase();
+  if (k === "image") return "images";
+  if (k === "video") return "video";
+  if (k === "audio") return "audio";
+  return "uploads";
+}
+
+function safeFilename(name) {
+  const base = (name || "file").replace(/[^a-zA-Z0-9._-]/g, "_");
+  return base.slice(0, 180);
+}
+
+function makeStorageKey({ auditId, kind, originalName }) {
+  const ext = path.extname(originalName || "");
+  const rand = crypto.randomBytes(8).toString("hex");
+  const sub = kindToSubdir(kind);
+  return path.join(auditId, "media", sub, `${Date.now()}_${rand}${ext}`);
+}
+
+function absPathForKey(storageKey) {
+  return path.join(auditsRoot(), storageKey);
+}
+
+// --------------------
+// Helpers: parsing CSV (simple, good enough for now)
+// --------------------
+function parseCsvToRows(csvText) {
+  // Minimal CSV parser: handles commas + basic quotes.
+  // This is enough for our test-audit.csv and many simple exports.
+  const lines = csvText.split(/\r?\n/).filter(Boolean);
+  if (lines.length === 0) return { header: [], rows: [] };
+
+  const parseLine = (line) => {
+    const out = [];
+    let cur = "";
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"' && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inQ = !inQ;
+        continue;
+      }
+      if (ch === "," && !inQ) {
+        out.push(cur);
+        cur = "";
+        continue;
+      }
+      cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  };
+
+  const header = parseLine(lines[0]);
+  const rows = lines.slice(1).map(parseLine).map((cols) => {
+    const obj = {};
+    for (let i = 0; i < header.length; i++) obj[header[i]] = cols[i] ?? "";
+    return obj;
+  });
+
+  return { header, rows };
+}
+
+function normalizeStatus(s) {
+  const v = String(s || "").trim().toUpperCase();
+  if (v === "PASS" || v === "OK") return "PASS";
+  if (v === "FAIL" || v === "NG") return "FAIL";
+  if (v === "NA" || v === "N/A") return "NA";
+  return v ? v : "UNKNOWN";
+}
+
+function computeSummary(items) {
+  const summary = { total: items.length, pass: 0, fail: 0, na: 0, unknown: 0 };
+  for (const it of items) {
+    if (it.status === "PASS") summary.pass++;
+    else if (it.status === "FAIL") summary.fail++;
+    else if (it.status === "NA") summary.na++;
+    else summary.unknown++;
+  }
+  return summary;
+}
+
+// --------------------
+// Helpers: reports (PDF / XLSX already existed conceptually; keep minimal working)
+// --------------------
+function buildPdfBuffer({ title, summary, items }) {
+  const doc = new PDFDocument({ size: "A4", margin: 50 });
+  const chunks = [];
+  doc.on("data", (d) => chunks.push(d));
+  return new Promise((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    doc.fontSize(18).text(title || "Audit Report", { align: "left" });
+    doc.moveDown();
+
+    doc.fontSize(12).text(`Total: ${summary.total}`);
+    doc.text(`PASS: ${summary.pass}`);
+    doc.text(`FAIL: ${summary.fail}`);
+    doc.text(`N/A: ${summary.na}`);
+    doc.text(`UNKNOWN: ${summary.unknown}`);
+    doc.moveDown();
+
+    doc.fontSize(12).text("Items:");
+    doc.moveDown(0.5);
+
+    for (const it of items) {
+      doc.text(`${it.idx}. ${it.id} — ${it.status} — ${it.comment || ""}`);
+    }
+
+    doc.end();
+  });
+}
+
+function buildXlsxBuffer({ sheetName, items }) {
+  const wsData = [
+    ["#", "Item", "Status", "Comment"],
+    ...items.map((it) => [it.idx, it.id, it.status, it.comment || ""]),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName || "Sheet1");
+  const out = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+  return out;
+}
+
+// --------------------
+// Helpers: DOCX template rendering (new)
+// --------------------
+function renderDocxFromTemplate({ templatePath, data }) {
+  const content = fs.readFileSync(templatePath, "binary");
+  const zip = new PizZip(content);
+
+  const doc = new Docxtemplater(zip, {
+    paragraphLoop: true,
+    linebreaks: true,
+  });
+
+  doc.render(data);
+
+  const buf = doc.getZip().generate({ type: "nodebuffer" });
+  return buf;
+}
+
+function makeDocxData({ audit, summary, items }) {
+  // Keep keys simple. You will align these with placeholders in the Word template.
+  // Example placeholders in DOCX: {title}, {site}, {standard}, {auditor}, {total}, {pass}, etc.
+  return {
+    title: audit.title || "Audit Report",
+    site: audit.site || "",
+    standard: audit.standard || "",
+    auditor: audit.auditor || "",
+    generatedAt: new Date().toISOString(),
+
+    total: summary.total,
+    pass: summary.pass,
+    fail: summary.fail,
+    na: summary.na,
+    unknown: summary.unknown,
+
+    // Loop in docxtemplater: {#items}{idx} {id} {status} {comment}{/items}
+    items: items.map((it) => ({
+      idx: it.idx,
+      id: it.id,
+      status: it.status,
+      comment: it.comment || "",
+    })),
+  };
+}
+
+async function readUploadFileToBuffer(file) {
+  const parts = [];
+  for await (const chunk of file.file) parts.push(chunk);
+  return Buffer.concat(parts);
+}
+
+// --------------------
+// Routes
+// --------------------
+app.get("/health", async () => {
+  return {
+    ok: true,
+    service: "sc-audit-copilot",
+    status: "running",
+    dbUrlLoaded: Boolean(DATABASE_URL),
+  };
+});
+
+// Upload CSV -> create audit + store mapping/report JSON
+app.post("/report/from-upload", async (request, reply) => {
+  const file = await request.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded" });
+
+  const buf = await readUploadFileToBuffer(file);
+  const filename = safeFilename(file.filename || "upload.csv");
+  const text = buf.toString("utf8");
+
+  const { header, rows } = parseCsvToRows(text);
+
+  // Basic mapping for our test CSV
+  const mapping = { id: "Item", status: "Status", comment: "Comment" };
+  const items = rows.map((r, idx) => ({
+    idx: idx + 1,
+    id: r[mapping.id] ?? "",
+    status: normalizeStatus(r[mapping.status]),
+    comment: r[mapping.comment] ?? "",
+  }));
+
+  const summary = computeSummary(items);
+
+  const audit = await prisma.audit.create({
+    data: {
+      title: "Audit Report",
+      site: null,
+      standard: null,
+      auditor: null,
+      sourceFile: filename,
+      mappingJson: mapping,
+      reportJson: {
+        sheet: "Sheet1",
+        header,
+        items,
+        summary,
+      },
+    },
+    select: { id: true, createdAt: true },
+  });
+
+  return reply.send({
+    ok: true,
+    auditId: audit.id,
+    generatedAt: new Date().toISOString(),
+    filename,
+    sheet: "Sheet1",
+    summary,
+    mapping,
+    preview: items.slice(0, 25),
+  });
+});
+
+// Upload any file to audit media storage + DB row
+app.post("/audits/:auditId/media", async (request, reply) => {
+  const { auditId } = request.params;
+  const kind = (request.query?.kind || "uploads").toString();
+
+  const audit = await prisma.audit.findUnique({ where: { id: auditId }, select: { id: true } });
+  if (!audit) return reply.code(404).send({ ok: false, error: "Audit not found", auditId });
+
+  const file = await request.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded" });
+
+  const buf = await readUploadFileToBuffer(file);
+  const originalName = safeFilename(file.filename || "file");
+  const storageKey = makeStorageKey({ auditId, kind, originalName });
+  const abs = absPathForKey(storageKey);
+
+  await ensureDir(path.dirname(abs));
+  await fsp.writeFile(abs, buf);
+
+  const row = await prisma.mediaFile.create({
+    data: {
+      auditId,
+      kind,
+      filename: originalName,
+      mime: file.mimetype || "application/octet-stream",
+      sizeBytes: buf.length,
+      storageKey,
+      notes: null,
+    },
+    select: { id: true, kind: true, filename: true, mime: true, sizeBytes: true, storageKey: true },
+  });
+
+  return reply.send({ ok: true, auditId, mediaId: row.id, ...row });
+});
+
+// PDF from upload (simple)
+app.post("/report/pdf/from-upload", async (request, reply) => {
+  const file = await request.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded" });
+
+  const buf = await readUploadFileToBuffer(file);
+  const text = buf.toString("utf8");
+  const { rows } = parseCsvToRows(text);
+
+  const mapping = { id: "Item", status: "Status", comment: "Comment" };
+  const items = rows.map((r, idx) => ({
+    idx: idx + 1,
+    id: r[mapping.id] ?? "",
+    status: normalizeStatus(r[mapping.status]),
+    comment: r[mapping.comment] ?? "",
+  }));
+  const summary = computeSummary(items);
+
+  const pdf = await buildPdfBuffer({ title: "Audit Report", summary, items });
+
+  reply.header("Content-Type", "application/pdf");
+  reply.header("Content-Disposition", `attachment; filename="audit-report.pdf"`);
+  return reply.send(pdf);
+});
+
+// XLSX from upload (simple)
+app.post("/report/xlsx/from-upload", async (request, reply) => {
+  const file = await request.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded" });
+
+  const buf = await readUploadFileToBuffer(file);
+  const text = buf.toString("utf8");
+  const { rows } = parseCsvToRows(text);
+
+  const mapping = { id: "Item", status: "Status", comment: "Comment" };
+  const items = rows.map((r, idx) => ({
+    idx: idx + 1,
+    id: r[mapping.id] ?? "",
+    status: normalizeStatus(r[mapping.status]),
+    comment: r[mapping.comment] ?? "",
+  }));
+
+  const xlsx = buildXlsxBuffer({ sheetName: "Sheet1", items });
+
+  reply.header(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  );
+  reply.header("Content-Disposition", `attachment; filename="audit-report.xlsx"`);
+  return reply.send(xlsx);
+});
+
+// --------------------
+// NEW: DOCX from upload using templates/audit-template.docx
+// --------------------
+app.post("/report/docx/from-upload", async (request, reply) => {
+  if (!fs.existsSync(TEMPLATE_PATH)) {
+    return reply.code(500).send({
+      ok: false,
+      error: "Template missing",
+      expectedPath: TEMPLATE_PATH,
+    });
+  }
+
+  const file = await request.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded" });
+
+  const buf = await readUploadFileToBuffer(file);
+  const filename = safeFilename(file.filename || "upload.csv");
+  const text = buf.toString("utf8");
+
+  const { header, rows } = parseCsvToRows(text);
+
+  const mapping = { id: "Item", status: "Status", comment: "Comment" };
+  const items = rows.map((r, idx) => ({
+    idx: idx + 1,
+    id: r[mapping.id] ?? "",
+    status: normalizeStatus(r[mapping.status]),
+    comment: r[mapping.comment] ?? "",
+  }));
+
+  const summary = computeSummary(items);
+
+  // Create + store audit so we have a stable ID trail
+  const audit = await prisma.audit.create({
+    data: {
+      title: "Audit Report",
+      sourceFile: filename,
+      mappingJson: mapping,
+      reportJson: { sheet: "Sheet1", header, items, summary },
+    },
+    select: { id: true, title: true, site: true, standard: true, auditor: true },
+  });
+
+  const docxData = makeDocxData({ audit, summary, items });
+  const out = renderDocxFromTemplate({ templatePath: TEMPLATE_PATH, data: docxData });
+
+  reply.header(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  );
+  reply.header("Content-Disposition", `attachment; filename="audit-report.docx"`);
+  return reply.send(out);
+});
+
+// Optional: download docx for existing auditId
+app.get("/audits/:auditId/report.docx", async (request, reply) => {
+  const { auditId } = request.params;
+
+  if (!fs.existsSync(TEMPLATE_PATH)) {
+    return reply.code(500).send({
+      ok: false,
+      error: "Template missing",
+      expectedPath: TEMPLATE_PATH,
+    });
+  }
+
+  const audit = await prisma.audit.findUnique({
+    where: { id: auditId },
+    select: { id: true, title: true, site: true, standard: true, auditor: true, reportJson: true },
+  });
+  if (!audit) return reply.code(404).send({ ok: false, error: "Audit not found", auditId });
+
+  const report = audit.reportJson || {};
+  const items = Array.isArray(report.items) ? report.items : [];
+  const summary = report.summary || computeSummary(items);
+
+  const docxData = makeDocxData({ audit, summary, items });
+  const out = renderDocxFromTemplate({ templatePath: TEMPLATE_PATH, data: docxData });
+
+  reply.header(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  );
+  reply.header("Content-Disposition", `attachment; filename="audit-${auditId}.docx"`);
+  return reply.send(out);
+});
+
+// --------------------
+app.listen({ port: PORT, host: HOST }, (err, address) => {
+  if (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+  console.log(`Server running at ${address}`);
+});

@@ -1,0 +1,322 @@
+import Fastify from "fastify";
+import multipart from "@fastify/multipart";
+import XLSX from "xlsx";
+import PDFDocument from "pdfkit";
+import { PrismaClient } from "@prisma/client";
+import fs from "node:fs";
+import path from "node:path";
+
+import {
+  auditDir,
+  safeFilename,
+  makeStorageKey,
+  absPathForKey,
+  ensureDir,
+} from "./src/storage/mediaStore.js";
+
+const app = Fastify({ logger: true });
+
+await app.register(multipart, {
+  limits: { fileSize: 300 * 1024 * 1024 }, // 300MB for longer clips
+});
+
+const prisma = new PrismaClient();
+
+const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || "0.0.0.0";
+
+function normalizeStatus(input) {
+  const s = String(input ?? "").trim().toLowerCase();
+  if (["pass", "passed", "ok", "yes", "true", "1"].includes(s)) return "PASS";
+  if (["fail", "failed", "no", "false", "0"].includes(s)) return "FAIL";
+  if (["na", "n/a", "not applicable"].includes(s)) return "NA";
+  if (s === "") return "UNKNOWN";
+  return s.toUpperCase();
+}
+
+function parseAuditRows(rows) {
+  const candidates = {
+    id: ["Item", "ID", "Requirement", "Requirement ID", "Check", "Control"],
+    status: ["Status", "Result", "Compliant", "Meets?", "Pass/Fail"],
+    comment: ["Comment", "Notes", "Observation", "Remarks", "Finding"],
+  };
+
+  const headers = rows.length ? Object.keys(rows[0]) : [];
+  const pickHeader = (list) => list.find((h) => headers.includes(h)) ?? null;
+
+  const idH = pickHeader(candidates.id);
+  const stH = pickHeader(candidates.status);
+  const cmH = pickHeader(candidates.comment);
+
+  const checks = rows.map((r, idx) => ({
+    idx: idx + 1,
+    id: idH ? String(r[idH] ?? "").trim() : `ROW_${idx + 1}`,
+    status: normalizeStatus(stH ? r[stH] : null),
+    comment: cmH ? String(r[cmH] ?? "").trim() : "",
+  }));
+
+  const summary = checks.reduce(
+    (acc, c) => {
+      acc.total += 1;
+      if (c.status === "PASS") acc.pass += 1;
+      else if (c.status === "FAIL") acc.fail += 1;
+      else if (c.status === "NA") acc.na += 1;
+      else acc.unknown += 1;
+      return acc;
+    },
+    { total: 0, pass: 0, fail: 0, na: 0, unknown: 0 }
+  );
+
+  return { headers, mapping: { id: idH, status: stH, comment: cmH }, checks, summary };
+}
+
+function parseWorkbookBuffer(buf) {
+  const wb = XLSX.read(buf, { type: "buffer" });
+  const sheetNames = wb.SheetNames || [];
+  if (!sheetNames.length) throw new Error("No sheets found in workbook.");
+  const activeSheet = sheetNames[0];
+  const sheet = wb.Sheets[activeSheet];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
+  const columns = rows.length ? Object.keys(rows[0]) : [];
+  return { sheetNames, activeSheet, rows, columns };
+}
+
+app.get("/health", async () => ({
+  ok: true,
+  service: "sc-audit-copilot",
+  status: "running",
+  dbUrlLoaded: Boolean(process.env.DATABASE_URL),
+}));
+
+app.get("/upload", async (req, reply) => {
+  reply.type("text/html").send(`
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Upload Audit</title></head>
+  <body style="font-family: Arial; padding: 20px;">
+    <h2>Upload Audit Spreadsheet</h2>
+    <form action="/upload/audit" method="post" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".xlsx,.xls,.csv" required />
+      <button type="submit">Upload (Preview)</button>
+    </form>
+    <form action="/report/from-upload" method="post" enctype="multipart/form-data" style="margin-top:16px;">
+      <input type="file" name="file" accept=".xlsx,.xls,.csv" required />
+      <button type="submit">Upload → Draft Report</button>
+    </form>
+  </body>
+</html>
+  `);
+});
+
+app.post("/upload/audit", async (req, reply) => {
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded. Field name must be 'file'." });
+
+  const buf = await file.toBuffer();
+  let parsed;
+  try {
+    parsed = parseWorkbookBuffer(buf);
+  } catch (e) {
+    return reply.code(400).send({ ok: false, error: "Could not parse file as Excel/CSV.", details: String(e?.message || e) });
+  }
+
+  return {
+    ok: true,
+    filename: file.filename,
+    mime: file.mimetype,
+    sheetNames: parsed.sheetNames,
+    activeSheet: parsed.activeSheet,
+    rowCount: parsed.rows.length,
+    columns: parsed.columns,
+    preview: parsed.rows.slice(0, 20),
+  };
+});
+
+app.post("/report/from-upload", async (req, reply) => {
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded. Field name must be 'file'." });
+
+  const buf = await file.toBuffer();
+  let parsed;
+  try {
+    parsed = parseWorkbookBuffer(buf);
+  } catch (e) {
+    return reply.code(400).send({ ok: false, error: "Could not parse file as Excel/CSV.", details: String(e?.message || e) });
+  }
+
+  const model = parseAuditRows(parsed.rows);
+
+  const audit = await prisma.audit.create({
+    data: {
+      title: "Data Center Audit - Draft",
+      standard: "TBD",
+      sourceFile: file.filename,
+      mappingJson: model.mapping,
+      reportJson: { summary: model.summary },
+    },
+    select: { id: true },
+  });
+
+  auditDir(audit.id);
+
+  return {
+    ok: true,
+    auditId: audit.id,
+    generatedAt: new Date().toISOString(),
+    filename: file.filename,
+    sheet: parsed.activeSheet,
+    summary: model.summary,
+    mapping: model.mapping,
+    preview: model.checks.slice(0, 20),
+  };
+});
+
+app.post("/report/pdf/from-upload", async (req, reply) => {
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded. Field name must be 'file'." });
+
+  const buf = await file.toBuffer();
+  let parsed;
+  try {
+    parsed = parseWorkbookBuffer(buf);
+  } catch (e) {
+    return reply.code(400).send({ ok: false, error: "Could not parse file as Excel/CSV.", details: String(e?.message || e) });
+  }
+
+  const model = parseAuditRows(parsed.rows);
+  const fails = model.checks.filter((c) => c.status === "FAIL");
+
+  const doc = new PDFDocument({ size: "A4", margin: 50 });
+  const chunks = [];
+  doc.on("data", (d) => chunks.push(d));
+  const done = new Promise((resolve) => doc.on("end", () => resolve(Buffer.concat(chunks))));
+
+  doc.fontSize(18).text("Data Center Audit Report (Draft)", { align: "left" });
+  doc.moveDown(0.5);
+  doc.fontSize(10).fillColor("gray").text(`Generated: ${new Date().toISOString()}`);
+  doc.fillColor("black");
+  doc.moveDown();
+
+  doc.fontSize(12).text("Summary", { underline: true });
+  doc.moveDown(0.3);
+  doc.fontSize(11).text(`Total checks: ${model.summary.total}`);
+  doc.text(`Pass: ${model.summary.pass}`);
+  doc.text(`Fail: ${model.summary.fail}`);
+  doc.text(`N/A: ${model.summary.na}`);
+  doc.text(`Unknown: ${model.summary.unknown}`);
+  doc.moveDown();
+
+  doc.fontSize(12).text("Non-Compliances (FAIL)", { underline: true });
+  doc.moveDown(0.3);
+
+  if (fails.length === 0) {
+    doc.fontSize(11).text("None. ✅");
+  } else {
+    fails.forEach((f, i) => {
+      doc.fontSize(11).text(`${i + 1}. ${f.id}`);
+      if (f.comment) doc.fontSize(10).fillColor("gray").text(`   ${f.comment}`).fillColor("black");
+      doc.moveDown(0.2);
+    });
+  }
+
+  doc.end();
+  const pdf = await done;
+
+  reply
+    .header("Content-Type", "application/pdf")
+    .header("Content-Disposition", 'attachment; filename="audit-report.pdf"')
+    .send(pdf);
+});
+
+app.post("/report/xlsx/from-upload", async (req, reply) => {
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded. Field name must be 'file'." });
+
+  const buf = await file.toBuffer();
+  let parsed;
+  try {
+    parsed = parseWorkbookBuffer(buf);
+  } catch (e) {
+    return reply.code(400).send({ ok: false, error: "Could not parse file as Excel/CSV.", details: String(e?.message || e) });
+  }
+
+  const model = parseAuditRows(parsed.rows);
+  const fails = model.checks.filter((c) => c.status === "FAIL");
+
+  const wb = XLSX.utils.book_new();
+
+  const summaryRows = [
+    { Key: "GeneratedAt", Value: new Date().toISOString() },
+    { Key: "Total", Value: model.summary.total },
+    { Key: "Pass", Value: model.summary.pass },
+    { Key: "Fail", Value: model.summary.fail },
+    { Key: "NA", Value: model.summary.na },
+    { Key: "Unknown", Value: model.summary.unknown },
+    { Key: "MappedIdColumn", Value: model.mapping.id ?? "" },
+    { Key: "MappedStatusColumn", Value: model.mapping.status ?? "" },
+    { Key: "MappedCommentColumn", Value: model.mapping.comment ?? "" },
+  ];
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Summary");
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(fails.map((f) => ({ ID: f.id, Status: f.status, Comment: f.comment }))),
+    "Findings"
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(model.checks.map((c) => ({ Index: c.idx, ID: c.id, Status: c.status, Comment: c.comment }))),
+    "Checks"
+  );
+
+  const out = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+  reply
+    .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    .header("Content-Disposition", 'attachment; filename="audit-report.xlsx"')
+    .send(out);
+});
+
+// Upload media (image/video/audio) to an audit
+app.post("/audits/:auditId/media", async (req, reply) => {
+  const { auditId } = req.params;
+
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ ok: false, error: "No file uploaded. Field name must be 'file'." });
+
+  const kind = String(req.query?.kind ?? "uploads"); // image|video|audio|uploads
+  const originalName = safeFilename(file.filename || "file");
+
+  // Ensure audit folder exists
+  auditDir(auditId);
+
+  const storageKey = makeStorageKey({ auditId, kind, originalName });
+  const absPath = absPathForKey(storageKey);
+  ensureDir(path.dirname(absPath));
+
+  const buf = await file.toBuffer();
+  fs.writeFileSync(absPath, buf);
+
+  const row = await prisma.mediaFile.create({
+    data: {
+      auditId,
+      kind,
+      filename: originalName,
+      mime: file.mimetype || "application/octet-stream",
+      sizeBytes: buf.length,
+      storageKey,
+      notes: null,
+    },
+    select: { id: true, kind: true, filename: true, mime: true, sizeBytes: true, storageKey: true },
+  });
+
+  return reply.send({ ok: true, auditId, mediaId: row.id, ...row });
+});
+
+app.listen({ port: PORT, host: HOST }, (err, address) => {
+  if (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+  console.log(`Server running at ${address}`);
+});

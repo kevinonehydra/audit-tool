@@ -1,0 +1,94 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  email        String   @unique
+  passwordHash String
+  role         String   @default("auditor") // auditor | admin
+
+  audits       Audit[]
+}
+
+model Audit {
+  id          String     @id @default(cuid())
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  title       String?
+  site        String?
+  standard    String?
+  auditor     String?
+
+  sourceFile  String?
+  mappingJson Json?
+  reportJson  Json?
+
+  // IMPORTANT: must be nullable while existing rows exist
+  userId      String?
+  user        User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  media       MediaFile[]
+  findings    Finding[]
+}
+
+model MediaFile {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+
+  auditId    String
+  audit      Audit    @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  kind       String
+  filename   String
+  mime       String
+  sizeBytes  Int
+  storageKey String
+
+  notes      String?
+
+  evidence   FindingEvidence[]
+}
+
+model Finding {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  auditId     String
+  audit       Audit    @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  severity    String   @default("medium") // low | medium | high | critical
+  area        String?
+  clauseRef   String?
+
+  evidence    FindingEvidence[]
+}
+
+model FindingEvidence {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  findingId String
+  finding   Finding   @relation(fields: [findingId], references: [id], onDelete: Cascade)
+
+  mediaId   String
+  media     MediaFile @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  note      String?
+
+  @@index([findingId])
+  @@index([mediaId])
+  @@unique([findingId, mediaId])
+}
