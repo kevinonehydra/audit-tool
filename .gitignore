@@ -4,3 +4,17 @@ storage
 dist
 coverage
 *.log
+
+# outputs / downloads
+*.pdf
+*.docx
+*.xlsx
+*.bin
+*.jpg
+*.jpeg
+*.png
+
+# editor + backups
+*~
+*.bak.*
+.DS_Store
