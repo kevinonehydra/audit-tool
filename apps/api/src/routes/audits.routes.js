@@ -281,4 +281,44 @@ export function auditsRoutes(app) {
     reply.header("Content-Disposition", `attachment; filename="audit_${auditId}.docx"`);
     return reply.send(docxBuf);
   });
+
+// =====================
+// Evidence: list for an audit
+// GET /audits/:id/evidence
+// =====================
+app.route({
+  method: "GET",
+  url: "/audits/:id/evidence",
+  preHandler: app.requireAuth ? app.requireAuth : undefined,
+  handler: async (req, reply) => {
+    const prisma = app.locals?.prisma;
+    if (!prisma) return reply.code(500).send({ message: "app.locals.prisma missing" });
+
+    const auditId = String(req.params.id);
+
+    // Try common table names; adjust if your Prisma model differs.
+    // 1) evidence (preferred)
+    // 2) auditEvidence (fallback)
+    let evidence = null;
+
+    if (prisma.evidence?.findMany) {
+      evidence = await prisma.evidence.findMany({
+        where: { auditId },
+        orderBy: { createdAt: "desc" },
+      });
+    } else if (prisma.auditEvidence?.findMany) {
+      evidence = await prisma.auditEvidence.findMany({
+        where: { auditId },
+        orderBy: { createdAt: "desc" },
+      });
+    } else {
+      return reply.code(500).send({
+        message: "No Prisma model found for evidence. Expected prisma.evidence or prisma.auditEvidence.",
+      });
+    }
+
+    return reply.send({ ok: true, auditId, evidence });
+  },
+});
+
 }

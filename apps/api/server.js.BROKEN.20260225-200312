@@ -1,0 +1,19 @@
+
+
+
+
+
+/* ====== Listen block (repaired) ====== */
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || 3001);
+
+try {
+  const addr = await app.listen({ host: HOST, port: PORT });
+  app.log.info(`Server listening at ${addr}`);
+  console.log(`Server running at http://${HOST}:${PORT}`);
+} catch (err) {
+  // app exists here (this is at the end of the file)
+  app.log.error(err);
+  process.exit(1);
+}
+/* ====== End listen block ====== */

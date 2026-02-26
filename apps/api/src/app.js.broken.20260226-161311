@@ -1,0 +1,46 @@
+import Fastify from "fastify";
+import multipart from "@fastify/multipart";
+import { PrismaClient } from "@prisma/client";
+
+import { 4:export function registerAuthRoutes(app) { } from "./routes/auth.routes.js";
+import { auditsRoutes } from "./routes/audits.routes.js";
+
+export async function buildApp() {
+  const app = Fastify({ logger: true });
+
+  // Attach Prisma
+  const prisma = new PrismaClient();
+  app.locals = app.locals || {};
+  app.locals.prisma = prisma;
+
+  // Multipart (file uploads)
+  await app.register(multipart, {
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  });
+
+  // Health endpoint
+  app.get("/health", async () => {
+    return {
+      ok: true,
+      service: "sc-audit-copilot",
+      status: "running",
+      dbUrlLoaded: Boolean(process.env.DATABASE_URL),
+    };
+  });
+
+  // Register routes
+  await app.register(4:export function registerAuthRoutes(app) {);
+  await app.register(auditsRoutes);
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    try { await prisma.$disconnect(); } catch {}
+    try { await app.close(); } catch {}
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  return app;
+}

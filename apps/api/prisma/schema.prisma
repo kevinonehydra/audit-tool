@@ -20,6 +20,7 @@ model User {
 }
 
 model Audit {
+  evidence Evidence[]
   id          String     @id @default(cuid())
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
@@ -91,4 +92,30 @@ model FindingEvidence {
   @@index([findingId])
   @@index([mediaId])
   @@unique([findingId, mediaId])
+}
+
+enum EvidenceType {
+  photo
+  video
+  audio
+}
+
+model Evidence {
+  id         String       @id @default(cuid())
+  auditId    String
+  type       EvidenceType
+  filePath   String
+  mimeType   String
+  sizeBytes  Int
+  capturedAt DateTime     @default(now())
+  notes      String?
+  metaJson   Json?
+
+  audit      Audit        @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([auditId])
+  @@index([type])
 }
